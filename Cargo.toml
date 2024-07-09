@@ -1,0 +1,19 @@
+[package]
+name = "peridot-wasm-scripting-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+peridot = { path = "../peridot/base" }
+peridot-math.path = "../peridot/modules/math"
+peridot-vertex-processing-pack.path = "../peridot/modules/vertex-processing-pack"
+peridot-memory-manager.path = "../peridot/modules/memory-manager"
+peridot-command-object = { path = "../peridot/modules/command-object", features = [
+    "memory-manager-interop",
+] }
+bedrock = { git = "https://github.com/Pctg-x8/bedrock", branch = "peridot", features = [
+    "Implements",
+    "VK_KHR_synchronization2",
+    "VK_KHR_create_renderpass2",
+    "VK_KHR_get_physical_device_properties2",
+] }
