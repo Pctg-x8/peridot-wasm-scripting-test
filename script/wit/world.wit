@@ -1,0 +1,44 @@
+package peridot:core;
+
+interface math {
+    record vector3 {
+        x: f32,
+        y: f32,
+        z: f32,
+    }
+
+    record quaternion {
+        x: f32,
+        y: f32,
+        z: f32,
+        w: f32,
+    }
+}
+
+interface engine {
+    use math.{vector3, quaternion};
+
+    resource transform-component {
+        position: func() -> vector3;
+        rotation: func() -> quaternion;
+        scale: func() -> vector3;
+        set-position: func(pos: vector3);
+        set-rotation: func(rot: quaternion);
+        set-scale: func(scale: vector3);
+        set-trs: func(pos: vector3, rot: quaternion, scale: vector3);
+    }
+
+    log: func(text: string);
+    subscribe-update: func(id: u32);
+    unsubscrube-update: func(id: u32);
+    delta-time-seconds: func() -> f32;
+
+    cube-transform: func() -> transform-component;
+}
+
+world component-script {
+    import engine;
+
+    export entrypoint: func();
+    export on-message: func(id: u32);
+}

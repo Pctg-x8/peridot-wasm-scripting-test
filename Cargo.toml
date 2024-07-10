@@ -17,3 +17,5 @@ bedrock = { git = "https://github.com/Pctg-x8/bedrock", branch = "peridot", feat
     "VK_KHR_create_renderpass2",
     "VK_KHR_get_physical_device_properties2",
 ] }
+wasmtime = { version = "22.0.0", features = ["runtime", "component-model"] }
+uuid = { version = "1.10.0", features = ["v7"] }

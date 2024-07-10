@@ -1,4 +1,8 @@
-use std::rc::Rc;
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+    sync::{Arc, RwLock},
+};
 
 use bedrock::{
     self as br, CommandBuffer, CommandPool, DescriptorPool, Device, GraphicsPipelineBuilder, Image,
@@ -12,6 +16,11 @@ use peridot_command_object::{
 use peridot_math::{One, Zero};
 use peridot_memory_manager::{BufferMapMode, MemoryManager};
 use peridot_vertex_processing_pack::PvpShaderModules;
+use uuid::Uuid;
+use wasmtime::{
+    component::{ComponentType, Lift, Lower, Resource, ResourceTable, ResourceType},
+    StoreContextMut,
+};
 
 #[repr(C)]
 #[derive(Clone)]
@@ -30,6 +39,12 @@ pub struct ObjectUniformData {
 pub struct Vertex {
     pos: peridot_math::Vector4F32,
     normal: peridot_math::Vector4F32,
+}
+
+pub struct CubeTransformComponent {
+    position: peridot_math::Vector3F32,
+    rotation: peridot_math::QuaternionF32,
+    scale: peridot_math::Vector3F32,
 }
 
 pub struct Renderer {
@@ -51,6 +66,7 @@ pub struct Renderer {
         br::PipelineObject<peridot::DeviceObject>,
         br::PipelineLayoutObject<peridot::DeviceObject>,
     >,
+    cube_transform_component: Arc<RwLock<CubeTransformComponent>>,
 }
 impl Renderer {
     fn new(
@@ -396,6 +412,11 @@ impl Renderer {
             _dsl_ub1: dsl_ub1,
             cube_shader: shader,
             cube_pipeline,
+            cube_transform_component: Arc::new(RwLock::new(CubeTransformComponent {
+                position: peridot_math::Vector3::ZERO,
+                rotation: peridot_math::Quaternion::ONE,
+                scale: peridot_math::Vector3::ONE,
+            })),
         })
     }
 
@@ -486,6 +507,157 @@ impl Renderer {
     }
 }
 
+pub struct ScriptComponentInstance {
+    store: wasmtime::Store<ScriptComponentInstanceState>,
+    instance: wasmtime::component::Instance,
+    on_message_func: wasmtime::component::TypedFunc<(u32,), ()>,
+}
+impl ScriptComponentInstance {
+    pub fn new(
+        mut store: wasmtime::Store<ScriptComponentInstanceState>,
+        instance: wasmtime::component::Instance,
+    ) -> Self {
+        let on_message_func = instance.get_typed_func(&mut store, "on-message").unwrap();
+
+        Self {
+            store,
+            instance,
+            on_message_func,
+        }
+    }
+
+    pub fn dispatch_message(&mut self, msg_id: u32) -> wasmtime::Result<()> {
+        self.on_message_func.call(&mut self.store, (msg_id,))?;
+        self.on_message_func.post_return(&mut self.store)?;
+
+        Ok(())
+    }
+}
+
+pub struct ScriptComponentInstanceState {
+    id: Uuid,
+    update_subscriptions_ref: Arc<RwLock<HashSet<(Uuid, u32)>>>,
+    delta_time_seconds: Arc<RwLock<f32>>,
+    resource_table: ResourceTable,
+}
+
+pub struct ScriptingEngine {
+    engine: wasmtime::Engine,
+    update_subscriptions: Arc<RwLock<HashSet<(Uuid, u32)>>>,
+    delta_time_seconds: Arc<RwLock<f32>>,
+    instance_map: HashMap<Uuid, ScriptComponentInstance>,
+}
+impl ScriptingEngine {
+    pub fn new() -> Self {
+        let engine = wasmtime::Engine::default();
+
+        Self {
+            engine,
+            update_subscriptions: Arc::new(RwLock::new(HashSet::new())),
+            delta_time_seconds: Arc::new(RwLock::new(0.0)),
+            instance_map: HashMap::new(),
+        }
+    }
+
+    pub fn update(&mut self, dt_sec: f32) {
+        *self.delta_time_seconds.write().unwrap() = dt_sec;
+
+        for (iid, mid) in self.update_subscriptions.read().unwrap().iter() {
+            self.instance_map
+                .get_mut(iid)
+                .unwrap()
+                .dispatch_message(*mid)
+                .expect("Failed to dispatch message");
+        }
+    }
+}
+
+pub struct ScriptingEngineTransformComponentRefResource {
+    entity_ref: Arc<RwLock<CubeTransformComponent>>,
+}
+impl ScriptingEngineTransformComponentRefResource {
+    pub fn position(&self) -> peridot_math::Vector3F32 {
+        self.entity_ref.read().unwrap().position.clone()
+    }
+
+    pub fn rotation(&self) -> peridot_math::QuaternionF32 {
+        self.entity_ref.read().unwrap().rotation.clone()
+    }
+
+    pub fn scale(&self) -> peridot_math::Vector3F32 {
+        self.entity_ref.read().unwrap().scale.clone()
+    }
+
+    pub fn set_position(&self, pos: peridot_math::Vector3F32) {
+        self.entity_ref.write().unwrap().position = pos;
+    }
+
+    pub fn set_rotation(&self, rot: peridot_math::QuaternionF32) {
+        self.entity_ref.write().unwrap().rotation = rot;
+    }
+
+    pub fn set_scale(&self, scale: peridot_math::Vector3F32) {
+        self.entity_ref.write().unwrap().scale = scale;
+    }
+}
+
+#[derive(ComponentType, Lower, Lift)]
+#[component(record)]
+pub struct ScriptingEngineMathVector3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+impl From<peridot_math::Vector3F32> for ScriptingEngineMathVector3 {
+    fn from(value: peridot_math::Vector3F32) -> Self {
+        Self {
+            x: value.0,
+            y: value.1,
+            z: value.2,
+        }
+    }
+}
+impl Into<peridot_math::Vector3F32> for ScriptingEngineMathVector3 {
+    fn into(self) -> peridot_math::Vector3F32 {
+        peridot_math::Vector3(self.x, self.y, self.z)
+    }
+}
+
+#[derive(ComponentType, Lower, Lift)]
+#[component(record)]
+pub struct ScriptingEngineMathQuaternion {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+}
+impl From<peridot_math::QuaternionF32> for ScriptingEngineMathQuaternion {
+    fn from(value: peridot_math::QuaternionF32) -> Self {
+        Self {
+            x: value.0,
+            y: value.1,
+            z: value.2,
+            w: value.3,
+        }
+    }
+}
+impl Into<peridot_math::QuaternionF32> for ScriptingEngineMathQuaternion {
+    fn into(self) -> peridot_math::QuaternionF32 {
+        peridot_math::Quaternion(self.x, self.y, self.z, self.w)
+    }
+}
+
+pub struct ScriptingEngineEntityResource {
+    entity_ref: Arc<RwLock<CubeTransformComponent>>,
+}
+impl ScriptingEngineEntityResource {
+    pub fn transform(&self) -> ScriptingEngineTransformComponentRefResource {
+        ScriptingEngineTransformComponentRefResource {
+            entity_ref: self.entity_ref.clone(),
+        }
+    }
+}
+
 pub struct Game<NL: NativeLinker> {
     memory_manager: MemoryManager,
     renderer: Renderer,
@@ -495,6 +667,7 @@ pub struct Game<NL: NativeLinker> {
     main_command_buffers: Vec<br::CommandBufferObject<peridot::DeviceObject>>,
     update_command_pool: br::CommandPoolObject<peridot::DeviceObject>,
     update_command_buffer: br::CommandBufferObject<peridot::DeviceObject>,
+    scripting_engine: ScriptingEngine,
     _ph: core::marker::PhantomData<*const NL>,
 }
 impl<NL: NativeLinker> FeatureRequests for Game<NL> {}
@@ -538,6 +711,143 @@ impl<NL: NativeLinker> EngineEvents<NL> for Game<NL> {
             .alloc_array::<1>(true)
             .expect("Failed to allocate update command buffer");
 
+        let mut scripting_engine = ScriptingEngine::new();
+        let script_path = std::env::current_dir().unwrap().join(
+            "../../../peridot-wasm-scripting-test/script/target/wasm32-unknown-unknown/release/script.wasm",
+        );
+        println!("script path: {}", script_path.display());
+        let script_bin = std::fs::read(script_path).expect("Failed to load script");
+        let script_component =
+            wasmtime::component::Component::new(&scripting_engine.engine, &script_bin)
+                .expect("Failed to create script component");
+        let mut linker = wasmtime::component::Linker::new(&scripting_engine.engine);
+        let mut engine_instance = linker
+            .instance("peridot:core/engine")
+            .expect("Failed to create external instance");
+        engine_instance
+            .func_wrap("log", |_store, (text,): (String,)| {
+                println!("script log: {text}");
+                Ok(())
+            })
+            .expect("Failed to register global func");
+        engine_instance
+            .func_wrap(
+                "subscribe-update",
+                |store: StoreContextMut<ScriptComponentInstanceState>, (id,): (u32,)| {
+                    let instance_id = store.data().id.clone();
+                    store
+                        .data()
+                        .update_subscriptions_ref
+                        .write()
+                        .unwrap()
+                        .insert((instance_id, id));
+
+                    Ok(())
+                },
+            )
+            .expect("Failed to register global func");
+        engine_instance
+            .func_wrap(
+                "unsubscribe-update",
+                |store: StoreContextMut<ScriptComponentInstanceState>, (id,): (u32,)| {
+                    let instance_id = store.data().id.clone();
+                    store
+                        .data()
+                        .update_subscriptions_ref
+                        .write()
+                        .unwrap()
+                        .remove(&(instance_id, id));
+
+                    Ok(())
+                },
+            )
+            .expect("Failed to register global func");
+        engine_instance
+            .func_wrap("cube-transform", {
+                let entity_ref = renderer.cube_transform_component.clone();
+
+                move |mut store: StoreContextMut<ScriptComponentInstanceState>, _params: ()| {
+                    Ok((store
+                        .data_mut()
+                        .resource_table
+                        .push(ScriptingEngineTransformComponentRefResource {
+                            entity_ref: entity_ref.clone(),
+                        })
+                        .unwrap(),))
+                }
+            })
+            .expect("Failed to register engine export fn");
+        engine_instance
+            .func_wrap(
+                "delta-time-seconds",
+                |store: StoreContextMut<ScriptComponentInstanceState>, _params: ()| {
+                    Ok((*store.data().delta_time_seconds.read().unwrap(),))
+                },
+            )
+            .expect("Failed to register global func");
+        engine_instance
+            .resource(
+                "transform-component",
+                ResourceType::host::<ScriptingEngineTransformComponentRefResource>(),
+                |_state, _handle| Ok(()),
+            )
+            .expect("Failed to register transform-component resource");
+        engine_instance.func_wrap("[method]transform-component.position", |store: StoreContextMut<ScriptComponentInstanceState>, (this,): (Resource<ScriptingEngineTransformComponentRefResource>,)| {
+            Ok((ScriptingEngineMathVector3::from(store.data().resource_table.get(&this).unwrap().position()),))
+        }).expect("Failed to set transform-component.position function impl");
+        engine_instance.func_wrap("[method]transform-component.rotation", |store: StoreContextMut<ScriptComponentInstanceState>, (this,): (Resource<ScriptingEngineTransformComponentRefResource>,)| {
+            Ok((ScriptingEngineMathQuaternion::from(store.data().resource_table.get(&this).unwrap().rotation()),))
+        }).expect("Failed to set transform-component.position function impl");
+        engine_instance
+            .func_wrap(
+                "[method]transform-component.set-rotation",
+                |store: StoreContextMut<ScriptComponentInstanceState>,
+                 (this, rot): (
+                    Resource<ScriptingEngineTransformComponentRefResource>,
+                    ScriptingEngineMathQuaternion,
+                )| {
+                    store
+                        .data()
+                        .resource_table
+                        .get(&this)
+                        .unwrap()
+                        .set_rotation(rot.into());
+                    Ok(())
+                },
+            )
+            .expect("Failed to set transform-component.position function impl");
+
+        let id = Uuid::now_v7();
+        let resource_table = ResourceTable::new();
+        let mut script_component_instance_store = wasmtime::Store::new(
+            &scripting_engine.engine,
+            ScriptComponentInstanceState {
+                id,
+                update_subscriptions_ref: scripting_engine.update_subscriptions.clone(),
+                delta_time_seconds: scripting_engine.delta_time_seconds.clone(),
+                resource_table,
+            },
+        );
+        let script_component_instance = linker
+            .instantiate(&mut script_component_instance_store, &script_component)
+            .expect("Failed to instantiate script component");
+        let ep_func = script_component_instance
+            .get_typed_func::<(), ()>(&mut script_component_instance_store, "entrypoint")
+            .expect("no entrypoint defined?");
+        ep_func
+            .call(&mut script_component_instance_store, ())
+            .expect("Failed to call entrypoint");
+        ep_func
+            .post_return(&mut script_component_instance_store)
+            .expect("Failed to post-return entrypoint");
+        scripting_engine.instance_map.insert(
+            id,
+            ScriptComponentInstance::new(
+                script_component_instance_store,
+                script_component_instance,
+            ),
+        );
+
         Self {
             memory_manager,
             renderer,
@@ -547,6 +857,7 @@ impl<NL: NativeLinker> EngineEvents<NL> for Game<NL> {
             main_command_buffers,
             update_command_pool,
             update_command_buffer,
+            scripting_engine,
             _ph: core::marker::PhantomData,
         }
     }
@@ -555,19 +866,27 @@ impl<NL: NativeLinker> EngineEvents<NL> for Game<NL> {
         &mut self,
         e: &mut peridot::Engine<NL>,
         on_back_buffer_of: u32,
-        _delta_time: std::time::Duration,
+        delta_time: std::time::Duration,
     ) {
+        self.scripting_engine.update(delta_time.as_secs_f32());
+
+        let transform_lock = self.renderer.cube_transform_component.read().unwrap();
         self.renderer
             .object_upload_buffer
             .guard_map(BufferMapMode::Write, |ptr| unsafe {
                 ptr.clone_to(
                     0,
                     &ObjectUniformData {
-                        object_matrix: peridot_math::Matrix4::ONE,
+                        object_matrix: peridot_math::Matrix4::trs(
+                            transform_lock.position.clone(),
+                            transform_lock.rotation.clone(),
+                            transform_lock.scale.clone(),
+                        ),
                     },
                 )
             })
             .expect("Failed to update object data");
+        drop(transform_lock);
         self.update_command_pool
             .reset(true)
             .expect("Failed to reset update command pool");

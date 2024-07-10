@@ -1,0 +1,27 @@
+[package]
+name = "script"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wit-bindgen-rt = { version = "0.27.0", features = ["bitflags"] }
+peridot-math = { path = "../../peridot/modules/math", default-features = false }
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+debug = false
+strip = true
+lto = true
+
+[package.metadata.component]
+package = "peridot:core"
+
+[package.metadata.component.target]
+world = "component-script"
+path = "./wit"
+
+[package.metadata.component.dependencies]
