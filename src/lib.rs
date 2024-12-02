@@ -5,13 +5,13 @@ use std::{
 };
 
 use bedrock::{
-    self as br, CommandBuffer, CommandPool, DescriptorPool, Device, GraphicsPipelineBuilder, Image,
-    ImageChild, ImageSubresourceSlice, SubmissionBatch,
+    self as br, CommandBufferMut, CommandPoolMut, DescriptorPoolMut, Device,
+    GraphicsPipelineBuilder, Image, ImageChild, ImageSubresourceSlice, RenderPass, SubmissionBatch,
 };
-use peridot::{EngineEvents, FeatureRequests, NativeLinker};
+use peridot::NativeLinker;
 use peridot_command_object::{
-    BeginRenderPass, BindGraphicsDescriptorSets, EndRenderPass, GraphicsCommand,
-    GraphicsCommandCombiner, RangedBuffer, StandardIndexedMesh,
+    BeginRenderPass, BindGraphicsDescriptorSets, BindGraphicsPipeline, EndRenderPass,
+    GraphicsCommand, GraphicsCommandCombiner, RangedBuffer, StandardIndexedMesh,
 };
 use peridot_math::{One, Zero};
 use peridot_memory_manager::{BufferMapMode, MemoryManager};
@@ -48,8 +48,9 @@ pub struct CubeTransformComponent {
 }
 
 pub struct Renderer {
+    render_target_size: peridot::math::Vector2<u32>,
     main_render_pass: br::RenderPassObject<peridot::DeviceObject>,
-    depth_buffer: Rc<br::ImageViewObject<peridot_memory_manager::Image>>,
+    depth_buffer: Arc<br::ImageViewObject<peridot_memory_manager::Image>>,
     device_buffer: peridot_memory_manager::Buffer,
     cube_vertex_offset: br::vk::VkDeviceSize,
     cube_index_offset: br::vk::VkDeviceSize,
@@ -62,10 +63,8 @@ pub struct Renderer {
     object_descriptor_set: br::DescriptorSet,
     _dsl_ub1: br::DescriptorSetLayoutObject<peridot::DeviceObject>,
     cube_shader: PvpShaderModules<'static, peridot::DeviceObject>,
-    cube_pipeline: peridot::LayoutedPipeline<
-        br::PipelineObject<peridot::DeviceObject>,
-        br::PipelineLayoutObject<peridot::DeviceObject>,
-    >,
+    cube_pipeline_layout: br::PipelineLayoutObject<peridot::DeviceObject>,
+    cube_pipeline: br::PipelineObject<peridot::DeviceObject>,
     cube_transform_component: Arc<RwLock<CubeTransformComponent>>,
 }
 impl Renderer {
@@ -332,23 +331,26 @@ impl Renderer {
             br::BufferDesc::new_for_type::<ObjectUniformData>(br::BufferUsage::TRANSFER_SRC),
         )?;
 
-        let dsl_ub1 = br::DescriptorSetLayoutBuilder::new()
-            .bind(
-                br::DescriptorType::UniformBuffer
-                    .make_binding(1)
-                    .only_for_vertex(),
-            )
-            .create(e.graphics_device().clone())?;
+        let dsl_ub1 = br::DescriptorSetLayoutBuilder::new(&[br::DescriptorType::UniformBuffer
+            .make_binding(0, 1)
+            .only_for_vertex()])
+        .create(e.graphics_device().clone())?;
 
         let shader = PvpShaderModules::new(
             e.graphics_device(),
             e.load("shaders.plain").expect("Failed to load shader"),
         )?;
-        let cube_pl = br::PipelineLayoutBuilder::new(vec![&dsl_ub1, &dsl_ub1], vec![])
-            .create(e.graphics_device().clone())?;
+        let cube_pl = br::PipelineLayoutBuilder::new(
+            &[
+                br::DescriptorSetLayoutObjectRef::new(&dsl_ub1),
+                br::DescriptorSetLayoutObjectRef::new(&dsl_ub1),
+            ],
+            &[],
+        )
+        .create(e.graphics_device().clone())?;
         let mut cube_pipeline = br::NonDerivedGraphicsPipelineBuilder::new(
             &cube_pl,
-            (&main_render_pass, 0),
+            main_render_pass.subpass(0),
             shader.generate_vps(br::vk::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST),
         );
         cube_pipeline
@@ -359,17 +361,14 @@ impl Renderer {
             .add_attachment_blend(br::AttachmentColorBlendState::premultiplied())
             .depth_test_settings(Some(br::CompareOp::LessOrEqual), true)
             .multisample_state(Some(br::MultisampleState::new()));
-        let cube_pipeline = peridot::LayoutedPipeline::combine(
-            cube_pipeline.create(
-                e.graphics_device().clone(),
-                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
-            )?,
-            cube_pl,
-        );
+        let cube_pipeline = cube_pipeline.create(
+            e.graphics_device().clone(),
+            None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+        )?;
 
-        let mut dp = br::DescriptorPoolBuilder::new(2)
-            .with_reservations(vec![br::DescriptorType::UniformBuffer.with_count(2)])
-            .create(e.graphics_device().clone())?;
+        let mut dp =
+            br::DescriptorPoolBuilder::new(2, &[br::DescriptorType::UniformBuffer.make_size(2)])
+                .create(e.graphics_device().clone())?;
         let [camera_descriptor_set, object_descriptor_set] = dp.alloc_array(&[
             br::DescriptorSetLayoutObjectRef::new(&dsl_ub1),
             br::DescriptorSetLayoutObjectRef::new(&dsl_ub1),
@@ -397,8 +396,9 @@ impl Renderer {
         );
 
         Ok(Self {
+            render_target_size: peridot::math::Vector2(frame_size.width, frame_size.height),
             main_render_pass,
-            depth_buffer: Rc::new(depth_buffer),
+            depth_buffer: Arc::new(depth_buffer),
             device_buffer,
             cube_vertex_offset,
             cube_index_offset,
@@ -411,6 +411,7 @@ impl Renderer {
             object_descriptor_set,
             _dsl_ub1: dsl_ub1,
             cube_shader: shader,
+            cube_pipeline_layout: cube_pl,
             cube_pipeline,
             cube_transform_component: Arc::new(RwLock::new(CubeTransformComponent {
                 position: peridot_math::Vector3::ZERO,
@@ -426,10 +427,12 @@ impl Renderer {
         memory_manager: &mut MemoryManager,
         new_size: peridot_math::Vector2<u32>,
     ) -> br::Result<()> {
+        self.render_target_size = new_size;
+
         let rect = br::vk::VkExtent2D::from(new_size).into_rect(br::vk::VkOffset2D::ZERO);
         let viewport = rect.make_viewport(0.0..1.0);
 
-        self.depth_buffer = Rc::new(
+        self.depth_buffer = Arc::new(
             memory_manager
                 .allocate_device_local_image(
                     e.graphics(),
@@ -442,8 +445,8 @@ impl Renderer {
         );
 
         let mut cube_pipeline = br::NonDerivedGraphicsPipelineBuilder::new(
-            self.cube_pipeline.layout(),
-            (&self.main_render_pass, 0),
+            &self.cube_pipeline_layout,
+            self.main_render_pass.subpass(0),
             self.cube_shader
                 .generate_vps(br::vk::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST),
         );
@@ -455,12 +458,10 @@ impl Renderer {
             .add_attachment_blend(br::AttachmentColorBlendState::premultiplied())
             .depth_test_settings(Some(br::CompareOp::LessOrEqual), true)
             .multisample_state(Some(br::MultisampleState::new()));
-        unsafe {
-            self.cube_pipeline.replace_pipeline(cube_pipeline.create(
-                e.graphics_device().clone(),
-                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
-            )?);
-        }
+        self.cube_pipeline = cube_pipeline.create(
+            e.graphics_device().clone(),
+            None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+        )?;
 
         Ok(())
     }
@@ -468,8 +469,8 @@ impl Renderer {
     fn populate_main_commands(
         &self,
         cb: &mut br::SynchronizedCommandBuffer<
-            impl br::CommandPool<ConcreteDevice = peridot::DeviceObject> + br::VkHandleMut,
-            impl br::CommandBuffer + br::VkHandleMut,
+            impl br::CommandPoolMut<ConcreteDevice = peridot::DeviceObject>,
+            impl br::CommandBufferMut,
         >,
         fb: &br::FramebufferObject<peridot::DeviceObject>,
     ) -> br::Result<()> {
@@ -489,18 +490,25 @@ impl Renderer {
         cube_mesh
             .draw(1)
             .after_of((
-                &self.cube_pipeline,
-                BindGraphicsDescriptorSets::new(&[
-                    self.camera_descriptor_set.0,
-                    self.object_descriptor_set.0,
-                ]),
+                BindGraphicsPipeline(&self.cube_pipeline),
+                BindGraphicsDescriptorSets::new(
+                    &self.cube_pipeline_layout,
+                    &[self.camera_descriptor_set, self.object_descriptor_set],
+                ),
             ))
             .between(
-                BeginRenderPass::for_entire_framebuffer(&self.main_render_pass, fb)
-                    .with_clear_values(vec![
-                        br::ClearValue::color_f32([0.0, 0.0, 0.2, 1.0]),
-                        br::ClearValue::depth_stencil(1.0, 0),
-                    ]),
+                BeginRenderPass::new(
+                    &self.main_render_pass,
+                    fb,
+                    br::vk::VkRect2D {
+                        offset: br::vk::VkOffset2D::ZERO,
+                        extent: self.render_target_size.into(),
+                    },
+                )
+                .with_clear_values(vec![
+                    br::ClearValue::color_f32([0.0, 0.0, 0.2, 1.0]),
+                    br::ClearValue::depth_stencil(1.0, 0),
+                ]),
                 EndRenderPass,
             )
             .execute_and_finish(cb.begin()?.as_dyn_ref())
@@ -658,316 +666,312 @@ impl ScriptingEngineEntityResource {
     }
 }
 
-pub struct Game<NL: NativeLinker> {
-    memory_manager: MemoryManager,
-    renderer: Renderer,
-    frame_size: peridot_math::Vector2<u32>,
-    frame_buffers: Vec<br::FramebufferObject<'static, peridot::DeviceObject>>,
-    main_command_pool: br::CommandPoolObject<peridot::DeviceObject>,
-    main_command_buffers: Vec<br::CommandBufferObject<peridot::DeviceObject>>,
-    update_command_pool: br::CommandPoolObject<peridot::DeviceObject>,
-    update_command_buffer: br::CommandBufferObject<peridot::DeviceObject>,
-    scripting_engine: ScriptingEngine,
-    _ph: core::marker::PhantomData<*const NL>,
-}
-impl<NL: NativeLinker> FeatureRequests for Game<NL> {}
-impl<NL: NativeLinker> EngineEvents<NL> for Game<NL> {
-    fn init(e: &mut peridot::Engine<NL>) -> Self {
-        let mut memory_manager = MemoryManager::new(e.graphics());
-        let renderer =
-            Renderer::new(e, &mut memory_manager).expect("Failed to initialize renderer");
+pub async fn game_main(e: &mut peridot::Engine<impl peridot::NativeLinker>) {
+    let mut memory_manager = MemoryManager::new(e.graphics());
+    let mut renderer =
+        Renderer::new(e, &mut memory_manager).expect("Failed to initialize renderer");
 
-        let frame_size = e.back_buffer(0).unwrap().image().size().as_2d_ref().clone();
-        let frame_buffers = e
-            .iter_back_buffers()
-            .map(|bb| {
-                br::FramebufferBuilder::new(&renderer.main_render_pass)
-                    .with_attachment(bb.clone())
-                    .with_attachment(renderer.depth_buffer.clone())
-                    .create()
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .expect("Failed to create framebuffer");
+    let mut frame_size = e.back_buffer(0).unwrap().image().size().as_2d_ref().clone();
+    let mut backbuffer_resources = e.iter_back_buffers().cloned().collect::<Vec<_>>();
+    let mut frame_buffers = backbuffer_resources
+        .iter()
+        .map(|bb| {
+            br::FramebufferBuilder::new(&renderer.main_render_pass)
+                .with_attachment(bb)
+                .with_attachment(&renderer.depth_buffer)
+                .create()
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .expect("Failed to create framebuffer");
 
-        let mut main_command_pool = br::CommandPoolBuilder::new(e.graphics_queue_family_index())
-            .create(e.graphics_device().clone())
-            .expect("Failed to create main command pool");
-        let mut main_command_buffers = main_command_pool
-            .alloc(e.back_buffer_count() as _, true)
-            .expect("Failed to allocate main command buffers");
-        for (cb, fb) in main_command_buffers.iter_mut().zip(frame_buffers.iter()) {
-            renderer
-                .populate_main_commands(
-                    &mut unsafe { cb.synchronize_with(&mut main_command_pool) },
-                    fb,
-                )
-                .expect("Failed to populate main commands");
-        }
+    let mut main_command_pool = br::CommandPoolBuilder::new(e.graphics_queue_family_index())
+        .create(e.graphics_device().clone())
+        .expect("Failed to create main command pool");
+    let mut main_command_buffers = main_command_pool
+        .alloc(e.back_buffer_count() as _, true)
+        .expect("Failed to allocate main command buffers");
+    for (cb, fb) in main_command_buffers.iter_mut().zip(frame_buffers.iter()) {
+        renderer
+            .populate_main_commands(
+                &mut unsafe { cb.synchronize_with(&mut main_command_pool) },
+                fb,
+            )
+            .expect("Failed to populate main commands");
+    }
 
-        let mut update_command_pool = br::CommandPoolBuilder::new(e.graphics_queue_family_index())
-            .create(e.graphics_device().clone())
-            .expect("Failed to create update command pool");
-        let [update_command_buffer] = update_command_pool
-            .alloc_array::<1>(true)
-            .expect("Failed to allocate update command buffer");
+    let mut update_command_pool = br::CommandPoolBuilder::new(e.graphics_queue_family_index())
+        .create(e.graphics_device().clone())
+        .expect("Failed to create update command pool");
+    let [mut update_command_buffer] = update_command_pool
+        .alloc_array::<1>(true)
+        .expect("Failed to allocate update command buffer");
 
-        let mut scripting_engine = ScriptingEngine::new();
-        let script_path = std::env::current_dir().unwrap().join(
-            "../../../peridot-wasm-scripting-test/script/target/wasm32-unknown-unknown/release/script.wasm",
-        );
-        println!("script path: {}", script_path.display());
-        let script_bin = std::fs::read(script_path).expect("Failed to load script");
-        let script_component =
-            wasmtime::component::Component::new(&scripting_engine.engine, &script_bin)
-                .expect("Failed to create script component");
-        let mut linker = wasmtime::component::Linker::new(&scripting_engine.engine);
-        let mut engine_instance = linker
-            .instance("peridot:core/engine")
-            .expect("Failed to create external instance");
-        engine_instance
-            .func_wrap("log", |_store, (text,): (String,)| {
-                println!("script log: {text}");
+    let mut scripting_engine = ScriptingEngine::new();
+    let script_path = std::env::current_dir().unwrap().join(
+        "../../../peridot-wasm-scripting-test/script/target/wasm32-unknown-unknown/release/script.wasm",
+    );
+    println!("script path: {}", script_path.display());
+    let script_bin = std::fs::read(script_path).expect("Failed to load script");
+    let script_component =
+        wasmtime::component::Component::new(&scripting_engine.engine, &script_bin)
+            .expect("Failed to create script component");
+    let mut linker = wasmtime::component::Linker::new(&scripting_engine.engine);
+    let mut engine_instance = linker
+        .instance("peridot:core/engine")
+        .expect("Failed to create external instance");
+    engine_instance
+        .func_wrap("log", |_store, (text,): (String,)| {
+            println!("script log: {text}");
+            Ok(())
+        })
+        .expect("Failed to register global func");
+    engine_instance
+        .func_wrap(
+            "subscribe-update",
+            |store: StoreContextMut<ScriptComponentInstanceState>, (id,): (u32,)| {
+                let instance_id = store.data().id.clone();
+                store
+                    .data()
+                    .update_subscriptions_ref
+                    .write()
+                    .unwrap()
+                    .insert((instance_id, id));
+
                 Ok(())
-            })
-            .expect("Failed to register global func");
-        engine_instance
-            .func_wrap(
-                "subscribe-update",
-                |store: StoreContextMut<ScriptComponentInstanceState>, (id,): (u32,)| {
-                    let instance_id = store.data().id.clone();
-                    store
-                        .data()
-                        .update_subscriptions_ref
-                        .write()
-                        .unwrap()
-                        .insert((instance_id, id));
-
-                    Ok(())
-                },
-            )
-            .expect("Failed to register global func");
-        engine_instance
-            .func_wrap(
-                "unsubscribe-update",
-                |store: StoreContextMut<ScriptComponentInstanceState>, (id,): (u32,)| {
-                    let instance_id = store.data().id.clone();
-                    store
-                        .data()
-                        .update_subscriptions_ref
-                        .write()
-                        .unwrap()
-                        .remove(&(instance_id, id));
-
-                    Ok(())
-                },
-            )
-            .expect("Failed to register global func");
-        engine_instance
-            .func_wrap("cube-transform", {
-                let entity_ref = renderer.cube_transform_component.clone();
-
-                move |mut store: StoreContextMut<ScriptComponentInstanceState>, _params: ()| {
-                    Ok((store
-                        .data_mut()
-                        .resource_table
-                        .push(ScriptingEngineTransformComponentRefResource {
-                            entity_ref: entity_ref.clone(),
-                        })
-                        .unwrap(),))
-                }
-            })
-            .expect("Failed to register engine export fn");
-        engine_instance
-            .func_wrap(
-                "delta-time-seconds",
-                |store: StoreContextMut<ScriptComponentInstanceState>, _params: ()| {
-                    Ok((*store.data().delta_time_seconds.read().unwrap(),))
-                },
-            )
-            .expect("Failed to register global func");
-        engine_instance
-            .resource(
-                "transform-component",
-                ResourceType::host::<ScriptingEngineTransformComponentRefResource>(),
-                |_state, _handle| Ok(()),
-            )
-            .expect("Failed to register transform-component resource");
-        engine_instance.func_wrap("[method]transform-component.position", |store: StoreContextMut<ScriptComponentInstanceState>, (this,): (Resource<ScriptingEngineTransformComponentRefResource>,)| {
-            Ok((ScriptingEngineMathVector3::from(store.data().resource_table.get(&this).unwrap().position()),))
-        }).expect("Failed to set transform-component.position function impl");
-        engine_instance.func_wrap("[method]transform-component.rotation", |store: StoreContextMut<ScriptComponentInstanceState>, (this,): (Resource<ScriptingEngineTransformComponentRefResource>,)| {
-            Ok((ScriptingEngineMathQuaternion::from(store.data().resource_table.get(&this).unwrap().rotation()),))
-        }).expect("Failed to set transform-component.position function impl");
-        engine_instance
-            .func_wrap(
-                "[method]transform-component.set-rotation",
-                |store: StoreContextMut<ScriptComponentInstanceState>,
-                 (this, rot): (
-                    Resource<ScriptingEngineTransformComponentRefResource>,
-                    ScriptingEngineMathQuaternion,
-                )| {
-                    store
-                        .data()
-                        .resource_table
-                        .get(&this)
-                        .unwrap()
-                        .set_rotation(rot.into());
-                    Ok(())
-                },
-            )
-            .expect("Failed to set transform-component.position function impl");
-
-        let id = Uuid::now_v7();
-        let resource_table = ResourceTable::new();
-        let mut script_component_instance_store = wasmtime::Store::new(
-            &scripting_engine.engine,
-            ScriptComponentInstanceState {
-                id,
-                update_subscriptions_ref: scripting_engine.update_subscriptions.clone(),
-                delta_time_seconds: scripting_engine.delta_time_seconds.clone(),
-                resource_table,
             },
-        );
-        let script_component_instance = linker
-            .instantiate(&mut script_component_instance_store, &script_component)
-            .expect("Failed to instantiate script component");
-        let ep_func = script_component_instance
-            .get_typed_func::<(), ()>(&mut script_component_instance_store, "entrypoint")
-            .expect("no entrypoint defined?");
-        ep_func
-            .call(&mut script_component_instance_store, ())
-            .expect("Failed to call entrypoint");
-        ep_func
-            .post_return(&mut script_component_instance_store)
-            .expect("Failed to post-return entrypoint");
-        scripting_engine.instance_map.insert(
+        )
+        .expect("Failed to register global func");
+    engine_instance
+        .func_wrap(
+            "unsubscribe-update",
+            |store: StoreContextMut<ScriptComponentInstanceState>, (id,): (u32,)| {
+                let instance_id = store.data().id.clone();
+                store
+                    .data()
+                    .update_subscriptions_ref
+                    .write()
+                    .unwrap()
+                    .remove(&(instance_id, id));
+
+                Ok(())
+            },
+        )
+        .expect("Failed to register global func");
+    engine_instance
+        .func_wrap("cube-transform", {
+            let entity_ref = renderer.cube_transform_component.clone();
+
+            move |mut store: StoreContextMut<ScriptComponentInstanceState>, _params: ()| {
+                Ok((store
+                    .data_mut()
+                    .resource_table
+                    .push(ScriptingEngineTransformComponentRefResource {
+                        entity_ref: entity_ref.clone(),
+                    })
+                    .unwrap(),))
+            }
+        })
+        .expect("Failed to register engine export fn");
+    engine_instance
+        .func_wrap(
+            "delta-time-seconds",
+            |store: StoreContextMut<ScriptComponentInstanceState>, _params: ()| {
+                Ok((*store.data().delta_time_seconds.read().unwrap(),))
+            },
+        )
+        .expect("Failed to register global func");
+    engine_instance
+        .resource(
+            "transform-component",
+            ResourceType::host::<ScriptingEngineTransformComponentRefResource>(),
+            |_state, _handle| Ok(()),
+        )
+        .expect("Failed to register transform-component resource");
+    engine_instance
+        .func_wrap(
+            "[method]transform-component.position",
+            |store: StoreContextMut<ScriptComponentInstanceState>,
+             (this,): (Resource<ScriptingEngineTransformComponentRefResource>,)| {
+                Ok((ScriptingEngineMathVector3::from(
+                    store.data().resource_table.get(&this).unwrap().position(),
+                ),))
+            },
+        )
+        .expect("Failed to set transform-component.position function impl");
+    engine_instance
+        .func_wrap(
+            "[method]transform-component.rotation",
+            |store: StoreContextMut<ScriptComponentInstanceState>,
+             (this,): (Resource<ScriptingEngineTransformComponentRefResource>,)| {
+                Ok((ScriptingEngineMathQuaternion::from(
+                    store.data().resource_table.get(&this).unwrap().rotation(),
+                ),))
+            },
+        )
+        .expect("Failed to set transform-component.position function impl");
+    engine_instance
+        .func_wrap(
+            "[method]transform-component.set-rotation",
+            |store: StoreContextMut<ScriptComponentInstanceState>,
+             (this, rot): (
+                Resource<ScriptingEngineTransformComponentRefResource>,
+                ScriptingEngineMathQuaternion,
+            )| {
+                store
+                    .data()
+                    .resource_table
+                    .get(&this)
+                    .unwrap()
+                    .set_rotation(rot.into());
+                Ok(())
+            },
+        )
+        .expect("Failed to set transform-component.position function impl");
+
+    let id = Uuid::now_v7();
+    let resource_table = ResourceTable::new();
+    let mut script_component_instance_store = wasmtime::Store::new(
+        &scripting_engine.engine,
+        ScriptComponentInstanceState {
             id,
-            ScriptComponentInstance::new(
-                script_component_instance_store,
-                script_component_instance,
-            ),
-        );
+            update_subscriptions_ref: scripting_engine.update_subscriptions.clone(),
+            delta_time_seconds: scripting_engine.delta_time_seconds.clone(),
+            resource_table,
+        },
+    );
+    let script_component_instance = linker
+        .instantiate(&mut script_component_instance_store, &script_component)
+        .expect("Failed to instantiate script component");
+    let ep_func = script_component_instance
+        .get_typed_func::<(), ()>(&mut script_component_instance_store, "entrypoint")
+        .expect("no entrypoint defined?");
+    ep_func
+        .call(&mut script_component_instance_store, ())
+        .expect("Failed to call entrypoint");
+    ep_func
+        .post_return(&mut script_component_instance_store)
+        .expect("Failed to post-return entrypoint");
+    scripting_engine.instance_map.insert(
+        id,
+        ScriptComponentInstance::new(script_component_instance_store, script_component_instance),
+    );
 
-        Self {
-            memory_manager,
-            renderer,
-            frame_size: frame_size.into(),
-            frame_buffers,
-            main_command_pool,
-            main_command_buffers,
-            update_command_pool,
-            update_command_buffer,
-            scripting_engine,
-            _ph: core::marker::PhantomData,
+    while let Some(ev) = e.event_receivers().wait_for_event().await {
+        match ev {
+            peridot::Event::Shutdown => break,
+            peridot::Event::NextFrame => {
+                let fd = match e.prepare_frame() {
+                    Ok(x) => x,
+                    Err(peridot::PrepareFrameError::FramebufferOutOfDate) => {
+                        todo!("resize handling in NextFrame");
+                    }
+                };
+
+                scripting_engine.update(fd.delta_time.as_secs_f32());
+
+                let transform_lock = renderer.cube_transform_component.read().unwrap();
+                renderer
+                    .object_upload_buffer
+                    .guard_map(BufferMapMode::Write, |ptr| unsafe {
+                        ptr.clone_to(
+                            0,
+                            &ObjectUniformData {
+                                object_matrix: peridot_math::Matrix4::trs(
+                                    transform_lock.position.clone(),
+                                    transform_lock.rotation.clone(),
+                                    transform_lock.scale.clone(),
+                                ),
+                            },
+                        )
+                    })
+                    .expect("Failed to update object data");
+                drop(transform_lock);
+                update_command_pool
+                    .reset(true)
+                    .expect("Failed to reset update command pool");
+                unsafe {
+                    update_command_buffer
+                        .begin(e.graphics_device())
+                        .expect("Failed to begin recording update commands")
+                }
+                .copy_buffer(
+                    &renderer.object_upload_buffer,
+                    &renderer.device_buffer,
+                    &[br::BufferCopy::copy_data::<ObjectUniformData>(
+                        0,
+                        renderer.object_uniform_offset,
+                    )],
+                )
+                .pipeline_barrier_2(&br::DependencyInfo::new(
+                    &[br::MemoryBarrier2::new()
+                        .from(
+                            br::PipelineStageFlags2::COPY,
+                            br::AccessFlags2::TRANSFER.write,
+                        )
+                        .to(
+                            br::PipelineStageFlags2::VERTEX_SHADER,
+                            br::AccessFlags2::UNIFORM_READ,
+                        )],
+                    &[],
+                    &[],
+                ))
+                .end()
+                .expect("Failed to finish command recording");
+
+                e.do_render(
+                    fd.backbuffer_index,
+                    Some(br::EmptySubmissionBatch.with_command_buffers(&[update_command_buffer])),
+                    br::EmptySubmissionBatch.with_command_buffers(&[
+                        main_command_buffers[fd.backbuffer_index as usize]
+                    ]),
+                )
+                .expect("Failed to render");
+            }
+            peridot::Event::Resize(new_size) => {
+                main_command_pool
+                    .reset(true)
+                    .expect("Failed to reset main commands");
+                drop(frame_buffers);
+                drop(backbuffer_resources);
+
+                e.resize_presenter_backbuffers(new_size);
+
+                frame_size.width = new_size.0 as _;
+                frame_size.height = new_size.1 as _;
+
+                renderer
+                    .resize(
+                        e,
+                        &mut memory_manager,
+                        peridot_math::Vector2(new_size.0 as _, new_size.1 as _),
+                    )
+                    .expect("Failed to resize in renderer");
+
+                backbuffer_resources = e.iter_back_buffers().cloned().collect::<Vec<_>>();
+                frame_buffers = backbuffer_resources
+                    .iter()
+                    .map(|bb| {
+                        br::FramebufferBuilder::new(&renderer.main_render_pass)
+                            .with_attachment(bb)
+                            .with_attachment(&renderer.depth_buffer)
+                            .create()
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("Failed to create framebuffer");
+
+                for (cb, fb) in main_command_buffers.iter_mut().zip(frame_buffers.iter()) {
+                    renderer
+                        .populate_main_commands(
+                            &mut unsafe { cb.synchronize_with(&mut main_command_pool) },
+                            fb,
+                        )
+                        .expect("Failed to populate main commands");
+                }
+            }
         }
     }
 
-    fn update(
-        &mut self,
-        e: &mut peridot::Engine<NL>,
-        on_back_buffer_of: u32,
-        delta_time: std::time::Duration,
-    ) {
-        self.scripting_engine.update(delta_time.as_secs_f32());
-
-        let transform_lock = self.renderer.cube_transform_component.read().unwrap();
-        self.renderer
-            .object_upload_buffer
-            .guard_map(BufferMapMode::Write, |ptr| unsafe {
-                ptr.clone_to(
-                    0,
-                    &ObjectUniformData {
-                        object_matrix: peridot_math::Matrix4::trs(
-                            transform_lock.position.clone(),
-                            transform_lock.rotation.clone(),
-                            transform_lock.scale.clone(),
-                        ),
-                    },
-                )
-            })
-            .expect("Failed to update object data");
-        drop(transform_lock);
-        self.update_command_pool
-            .reset(true)
-            .expect("Failed to reset update command pool");
-        unsafe {
-            self.update_command_buffer
-                .begin(e.graphics_device())
-                .expect("Failed to begin recording update commands")
-        }
-        .copy_buffer(
-            &self.renderer.object_upload_buffer,
-            &self.renderer.device_buffer,
-            &[br::BufferCopy::copy_data::<ObjectUniformData>(
-                0,
-                self.renderer.object_uniform_offset,
-            )],
-        )
-        .pipeline_barrier_2(&br::DependencyInfo::new(
-            &[br::MemoryBarrier2::new()
-                .from(
-                    br::PipelineStageFlags2::COPY,
-                    br::AccessFlags2::TRANSFER.write,
-                )
-                .to(
-                    br::PipelineStageFlags2::VERTEX_SHADER,
-                    br::AccessFlags2::UNIFORM_READ,
-                )],
-            &[],
-            &[],
-        ))
-        .end()
-        .expect("Failed to finish command recording");
-
-        e.do_render(
-            on_back_buffer_of,
-            Some(br::EmptySubmissionBatch.with_command_buffers(&[self.update_command_buffer])),
-            br::EmptySubmissionBatch
-                .with_command_buffers(&[self.main_command_buffers[on_back_buffer_of as usize]]),
-        )
-        .expect("Failed to render");
-    }
-
-    fn discard_back_buffer_resources(&mut self) {
-        self.main_command_pool
-            .reset(true)
-            .expect("Failed to reset main commands");
-        self.frame_buffers.clear();
-    }
-
-    fn on_resize(&mut self, e: &mut peridot::Engine<NL>, new_size: peridot_math::Vector2<usize>) {
-        self.frame_size = peridot_math::Vector2(new_size.0 as _, new_size.1 as _);
-
-        self.renderer
-            .resize(
-                e,
-                &mut self.memory_manager,
-                peridot_math::Vector2(new_size.0 as _, new_size.1 as _),
-            )
-            .expect("Failed to resize in renderer");
-
-        self.frame_buffers = e
-            .iter_back_buffers()
-            .map(|bb| {
-                br::FramebufferBuilder::new(&self.renderer.main_render_pass)
-                    .with_attachment(bb.clone())
-                    .with_attachment(self.renderer.depth_buffer.clone())
-                    .create()
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .expect("Failed to create framebuffer");
-
-        for (cb, fb) in self
-            .main_command_buffers
-            .iter_mut()
-            .zip(self.frame_buffers.iter())
-        {
-            self.renderer
-                .populate_main_commands(
-                    &mut unsafe { cb.synchronize_with(&mut self.main_command_pool) },
-                    fb,
-                )
-                .expect("Failed to populate main commands");
-        }
+    unsafe {
+        e.graphics_device().wait().expect("Failed to wait works");
     }
 }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-peridot = { path = "../peridot/base" }
+peridot = { path = "../peridot/base", features = ["mt"] }
 peridot-math.path = "../peridot/modules/math"
 peridot-vertex-processing-pack.path = "../peridot/modules/vertex-processing-pack"
 peridot-memory-manager.path = "../peridot/modules/memory-manager"
@@ -17,5 +17,5 @@ bedrock = { git = "https://github.com/Pctg-x8/bedrock", branch = "peridot", feat
     "VK_KHR_create_renderpass2",
     "VK_KHR_get_physical_device_properties2",
 ] }
-wasmtime = { version = "22.0.0", features = ["runtime", "component-model"] }
+wasmtime = { version = "27.0.0", features = ["runtime", "component-model"] }
 uuid = { version = "1.10.0", features = ["v7"] }
