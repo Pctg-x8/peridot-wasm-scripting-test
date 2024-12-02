@@ -863,7 +863,55 @@ pub async fn game_main(e: &mut peridot::Engine<impl peridot::NativeLinker>) {
                 let fd = match e.prepare_frame() {
                     Ok(x) => x,
                     Err(peridot::PrepareFrameError::FramebufferOutOfDate) => {
-                        todo!("resize handling in NextFrame");
+                        let new_size: peridot::math::Vector2<u32> = e
+                            .back_buffer(0)
+                            .unwrap()
+                            .image()
+                            .size()
+                            .as_2d_ref()
+                            .clone()
+                            .into();
+                        main_command_pool
+                            .reset(true)
+                            .expect("Failed to reset main commands");
+                        drop(frame_buffers);
+                        drop(backbuffer_resources);
+
+                        e.resize_presenter_backbuffers(new_size);
+
+                        frame_size.width = new_size.0 as _;
+                        frame_size.height = new_size.1 as _;
+
+                        renderer
+                            .resize(
+                                e,
+                                &mut memory_manager,
+                                peridot_math::Vector2(new_size.0 as _, new_size.1 as _),
+                            )
+                            .expect("Failed to resize in renderer");
+
+                        backbuffer_resources = e.iter_back_buffers().cloned().collect::<Vec<_>>();
+                        frame_buffers = backbuffer_resources
+                            .iter()
+                            .map(|bb| {
+                                br::FramebufferBuilder::new(&renderer.main_render_pass)
+                                    .with_attachment(bb)
+                                    .with_attachment(&renderer.depth_buffer)
+                                    .create()
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                            .expect("Failed to create framebuffer");
+
+                        for (cb, fb) in main_command_buffers.iter_mut().zip(frame_buffers.iter()) {
+                            renderer
+                                .populate_main_commands(
+                                    &mut unsafe { cb.synchronize_with(&mut main_command_pool) },
+                                    fb,
+                                )
+                                .expect("Failed to populate main commands");
+                        }
+
+                        continue;
                     }
                 };
 
